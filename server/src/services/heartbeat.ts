@@ -8606,9 +8606,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     let projectId = readNonEmptyString(enrichedContextSnapshot.projectId);
     if (!projectId && issueId) {
-      // issuesSvc.getById resolves both UUIDs and identifiers (e.g. "ENV-13")
-      const resolvedIssue = await issuesSvc.getById(issueId);
-      if (resolvedIssue?.companyId === agent.companyId) {
+      // Look up by either UUID or identifier (e.g. "ENV-13"), but always scope
+      // by companyId so a row from another tenant can never be returned even
+      // when identifiers collide across companies.
+      const resolvedIssue = await db
+        .select({ id: issues.id, projectId: issues.projectId })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, agent.companyId),
+            or(eq(issues.id, issueId), eq(issues.identifier, issueId.toUpperCase())),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (resolvedIssue) {
         projectId = resolvedIssue.projectId ?? null;
         // Canonicalize context to the UUID so downstream lookups always use UUID
         if (resolvedIssue.id !== issueId) {
