@@ -241,7 +241,14 @@ export async function testEnvironment(
   }
 
   if (canRunProbe) {
-    const probeArgs = ["--output-format", "streaming-json", "--permission-mode", "dontAsk", "--disable-web-search", "--no-subagents", "--no-plan"];
+    const probeArgs = [
+      "--output-format",
+      "streaming-json",
+      "--always-approve",
+      "--permission-mode",
+      "dontAsk",
+      "--disable-web-search",
+    ];
     if (configuredModel && configuredModel !== DEFAULT_GROK_LOCAL_MODEL) {
       probeArgs.push("--model", configuredModel);
     }

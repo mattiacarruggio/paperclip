@@ -86,6 +86,23 @@ describe("grok_local testEnvironment", () => {
         "grok_hello_probe_passed",
       ]),
     );
+    expect(runProcessMock).toHaveBeenNthCalledWith(
+      2,
+      expect.any(String),
+      null,
+      "grok",
+      expect.arrayContaining([
+        "--output-format",
+        "streaming-json",
+        "--always-approve",
+        "--permission-mode",
+        "dontAsk",
+        "--disable-web-search",
+        "--single",
+        "Respond with exactly hello.",
+      ]),
+      expect.any(Object),
+    );
   });
 
   it("downgrades auth failures to warnings", async () => {

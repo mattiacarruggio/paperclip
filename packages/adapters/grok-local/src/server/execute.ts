@@ -173,7 +173,7 @@ async function stageGrokProjectAssets(input: {
     stagedInstructionsPath,
     rulesFilePath,
     cleanup: async () => {
-      for (const entry of cleanup.reverse()) {
+      for (const entry of [...cleanup].reverse()) {
         if (entry.kind === "file") {
           await fs.rm(entry.path, { force: true }).catch(() => undefined);
           continue;
