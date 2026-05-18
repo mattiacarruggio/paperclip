@@ -47,6 +47,7 @@ import {
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 import { getPluginUiContributionMetadata, pluginLoader } from "../services/plugin-loader.js";
+import { logger } from "../middleware/logger.js";
 import { logActivity } from "../services/activity-log.js";
 import { publishGlobalLiveEvent } from "../services/live-events.js";
 import { issueService } from "../services/issues.js";
@@ -2259,8 +2260,12 @@ export function pluginRoutes(
    *
    * Response: `{ deliveryId: string, status: string }`
    * Errors:
-   * - 404 if plugin not found or endpointKey not declared
-   * - 400 if plugin is not in ready state or lacks webhooks.receive capability
+   * - 404 with body `{ error: "webhook not delivered" }` for every
+   *   pre-dispatch rejection (plugin missing, not ready, manifest missing,
+   *   webhooks.receive capability missing, or endpointKey not declared).
+   *   The real cause is logged server-side and never returned to the
+   *   anonymous caller — see audit §F10 / MAT-669: distinct error strings
+   *   used to leak plugin-ID lifecycle to unauthenticated probes.
    * - 502 if the worker is unavailable or the RPC call fails
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
@@ -2270,34 +2275,45 @@ export function pluginRoutes(
     }
 
     const { pluginId, endpointKey } = req.params;
+    const webhookLog = logger.child({
+      service: "plugin-webhook-ingest",
+      pluginId,
+      endpointKey,
+    });
+    const rejectNotDelivered = (
+      reason: string,
+      details?: Record<string, unknown>,
+    ) => {
+      webhookLog.warn(
+        { reason, ...(details ?? {}) },
+        "Webhook delivery rejected before dispatch",
+      );
+      res.status(404).json({ error: "webhook not delivered" });
+    };
 
     // Step 1: Resolve the plugin
     const plugin = await resolvePlugin(registry, pluginId);
     if (!plugin) {
-      res.status(404).json({ error: "Plugin not found" });
+      rejectNotDelivered("plugin_not_found");
       return;
     }
 
     // Step 2: Validate the plugin is in 'ready' state
     if (plugin.status !== "ready") {
-      res.status(400).json({
-        error: `Plugin is not ready (current status: ${plugin.status})`,
-      });
+      rejectNotDelivered("plugin_not_ready", { status: plugin.status });
       return;
     }
 
     // Step 3: Validate the plugin has webhooks.receive capability
     const manifest = plugin.manifestJson;
     if (!manifest) {
-      res.status(400).json({ error: "Plugin manifest is missing" });
+      rejectNotDelivered("manifest_missing");
       return;
     }
 
     const capabilities = manifest.capabilities ?? [];
     if (!capabilities.includes("webhooks.receive")) {
-      res.status(400).json({
-        error: "Plugin does not have the webhooks.receive capability",
-      });
+      rejectNotDelivered("capability_missing");
       return;
     }
 
@@ -2307,9 +2323,7 @@ export function pluginRoutes(
       (w) => w.endpointKey === endpointKey,
     );
     if (!webhookDecl) {
-      res.status(404).json({
-        error: `Webhook endpoint '${endpointKey}' is not declared by this plugin`,
-      });
+      rejectNotDelivered("endpoint_not_declared");
       return;
     }
 
