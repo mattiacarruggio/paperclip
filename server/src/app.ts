@@ -9,6 +9,7 @@ import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
+import { isTrustProxyEnabled, parseTrustProxy } from "./middleware/trust-proxy.js";
 import { healthRoutes } from "./routes/health.js";
 import { companyRoutes } from "./routes/companies.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
@@ -137,6 +138,14 @@ export async function createApp(
 ) {
   const app = express();
 
+  // Default: do not trust proxy headers (X-Forwarded-*). Opt in via
+  // PAPERCLIP_TRUST_PROXY when the runtime sits behind a real reverse proxy.
+  // Without this, a client can spoof X-Forwarded-Host and bypass the
+  // private-hostname guard / extend the board-mutation trusted-origin set.
+  const trustProxy = parseTrustProxy(process.env.PAPERCLIP_TRUST_PROXY);
+  const trustProxyEnabled = isTrustProxyEnabled(trustProxy);
+  app.set("trust proxy", trustProxy);
+
   app.use(express.json({
     // Company import/export payloads can inline full portable packages.
     limit: "10mb",
@@ -158,6 +167,7 @@ export async function createApp(
       enabled: privateHostnameGateEnabled,
       allowedHostnames: opts.allowedHostnames,
       bindHost: opts.bindHost,
+      trustProxy: trustProxyEnabled,
     }),
   );
   app.use(
@@ -177,7 +187,7 @@ export async function createApp(
 
   // Mount API routes
   const api = Router();
-  api.use(boardMutationGuard());
+  api.use(boardMutationGuard({ trustProxy: trustProxyEnabled }));
   api.use(
     "/health",
     healthRoutes(db, {

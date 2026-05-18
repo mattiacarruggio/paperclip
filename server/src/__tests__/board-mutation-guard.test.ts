@@ -6,6 +6,7 @@ import { boardMutationGuard } from "../middleware/board-mutation-guard.js";
 function createApp(
   actorType: "board" | "agent",
   boardSource: "session" | "local_implicit" | "board_key" = "session",
+  opts: { trustProxy?: boolean } = {},
 ) {
   const app = express();
   app.use(express.json());
@@ -15,7 +16,7 @@ function createApp(
       : { type: "agent", agentId: "agent-1" };
     next();
   });
-  app.use(boardMutationGuard());
+  app.use(boardMutationGuard({ trustProxy: opts.trustProxy ?? false }));
   app.post("/mutate", (_req, res) => {
     res.status(204).end();
   });
@@ -84,8 +85,8 @@ describe("boardMutationGuard", () => {
     expect([200, 204]).toContain(res.status);
   });
 
-  it("allows board mutations when x-forwarded-host matches origin", async () => {
-    const app = createApp("board");
+  it("allows board mutations when x-forwarded-host matches origin and trustProxy is on", async () => {
+    const app = createApp("board", "session", { trustProxy: true });
     const res = await request(app)
       .post("/mutate")
       .set("Host", "127.0.0.1")
@@ -93,6 +94,20 @@ describe("boardMutationGuard", () => {
       .set("Origin", "https://10.90.10.20:3443")
       .send({ ok: true });
     expect([200, 204]).toContain(res.status);
+  });
+
+  it("blocks board mutations when x-forwarded-host is spoofed and trustProxy is off", async () => {
+    const app = createApp("board", "session", { trustProxy: false });
+    const res = await request(app)
+      .post("/mutate")
+      .set("Host", "127.0.0.1")
+      .set("X-Forwarded-Host", "10.90.10.20:3443")
+      .set("Origin", "https://10.90.10.20:3443")
+      .send({ ok: true });
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({
+      error: "Board mutation requires trusted browser origin",
+    });
   });
 
   it("blocks board mutations when x-forwarded-host does not match origin", async () => {

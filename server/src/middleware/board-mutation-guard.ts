@@ -16,9 +16,11 @@ function parseOrigin(value: string | undefined) {
   }
 }
 
-function trustedOriginsForRequest(req: Request) {
+function trustedOriginsForRequest(req: Request, opts: { trustProxy: boolean }) {
   const origins = new Set(DEFAULT_DEV_ORIGINS.map((value) => value.toLowerCase()));
-  const forwardedHost = req.header("x-forwarded-host")?.split(",")[0]?.trim();
+  const forwardedHost = opts.trustProxy
+    ? req.header("x-forwarded-host")?.split(",")[0]?.trim()
+    : undefined;
   const host = forwardedHost || req.header("host")?.trim();
   if (host) {
     origins.add(`http://${host}`.toLowerCase());
@@ -33,8 +35,8 @@ function trustedOriginsForRequest(req: Request) {
   return origins;
 }
 
-function isTrustedBoardMutationRequest(req: Request) {
-  const allowedOrigins = trustedOriginsForRequest(req);
+function isTrustedBoardMutationRequest(req: Request, opts: { trustProxy: boolean }) {
+  const allowedOrigins = trustedOriginsForRequest(req, opts);
   const origin = parseOrigin(req.header("origin"));
   if (origin && allowedOrigins.has(origin)) return true;
 
@@ -44,7 +46,8 @@ function isTrustedBoardMutationRequest(req: Request) {
   return false;
 }
 
-export function boardMutationGuard(): RequestHandler {
+export function boardMutationGuard(opts?: { trustProxy?: boolean }): RequestHandler {
+  const trustProxy = opts?.trustProxy ?? false;
   return (req, res, next) => {
     if (SAFE_METHODS.has(req.method.toUpperCase())) {
       next();
@@ -63,7 +66,7 @@ export function boardMutationGuard(): RequestHandler {
       return;
     }
 
-    if (!isTrustedBoardMutationRequest(req)) {
+    if (!isTrustedBoardMutationRequest(req, { trustProxy })) {
       res.status(403).json({ error: "Board mutation requires trusted browser origin" });
       return;
     }

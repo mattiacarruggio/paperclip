@@ -5,8 +5,10 @@ function isLoopbackHostname(hostname: string): boolean {
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
 }
 
-function extractHostname(req: Request): string | null {
-  const forwardedHost = req.header("x-forwarded-host")?.split(",")[0]?.trim();
+function extractHostname(req: Request, opts: { trustProxy: boolean }): string | null {
+  const forwardedHost = opts.trustProxy
+    ? req.header("x-forwarded-host")?.split(",")[0]?.trim()
+    : undefined;
   const hostHeader = req.header("host")?.trim();
   const raw = forwardedHost || hostHeader;
   if (!raw) return null;
@@ -53,6 +55,7 @@ export function privateHostnameGuard(opts: {
   enabled: boolean;
   allowedHostnames: string[];
   bindHost: string;
+  trustProxy?: boolean;
 }): RequestHandler {
   if (!opts.enabled) {
     return (_req, _res, next) => next();
@@ -62,9 +65,10 @@ export function privateHostnameGuard(opts: {
     allowedHostnames: opts.allowedHostnames,
     bindHost: opts.bindHost,
   });
+  const trustProxy = opts.trustProxy ?? false;
 
   return (req, res, next) => {
-    const hostname = extractHostname(req);
+    const hostname = extractHostname(req, { trustProxy });
     const wantsJson = req.path.startsWith("/api") || req.accepts(["json", "html", "text"]) === "json";
 
     if (!hostname) {

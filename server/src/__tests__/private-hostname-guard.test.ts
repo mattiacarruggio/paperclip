@@ -5,13 +5,19 @@ import { privateHostnameGuard } from "../middleware/private-hostname-guard.js";
 
 const unknownHostname = "blocked-host.invalid";
 
-function createApp(opts: { enabled: boolean; allowedHostnames?: string[]; bindHost?: string }) {
+function createApp(opts: {
+  enabled: boolean;
+  allowedHostnames?: string[];
+  bindHost?: string;
+  trustProxy?: boolean;
+}) {
   const app = express();
   app.use(
     privateHostnameGuard({
       enabled: opts.enabled,
       allowedHostnames: opts.allowedHostnames ?? [],
       bindHost: opts.bindHost ?? "0.0.0.0",
+      trustProxy: opts.trustProxy ?? false,
     }),
   );
   app.get("/api/health", (_req, res) => {
@@ -47,6 +53,33 @@ describe("privateHostnameGuard", () => {
     const res = await request(app).get("/api/health").set("Host", `${unknownHostname}:3100`);
     expect(res.status).toBe(403);
     expect(res.body?.error).toContain(`please run pnpm paperclipai allowed-hostname ${unknownHostname}`);
+  });
+
+  it("ignores spoofed X-Forwarded-Host when trustProxy is off (default)", async () => {
+    const app = createApp({
+      enabled: true,
+      allowedHostnames: ["allowed-host"],
+      trustProxy: false,
+    });
+    const res = await request(app)
+      .get("/api/health")
+      .set("Host", `${unknownHostname}:3100`)
+      .set("X-Forwarded-Host", "allowed-host:3100");
+    expect(res.status).toBe(403);
+    expect(res.body?.error).toContain(`please run pnpm paperclipai allowed-hostname ${unknownHostname}`);
+  });
+
+  it("honors X-Forwarded-Host when trustProxy is on", async () => {
+    const app = createApp({
+      enabled: true,
+      allowedHostnames: ["allowed-host"],
+      trustProxy: true,
+    });
+    const res = await request(app)
+      .get("/api/health")
+      .set("Host", `${unknownHostname}:3100`)
+      .set("X-Forwarded-Host", "allowed-host:3100");
+    expect(res.status).toBe(200);
   });
 
   it("blocks unknown hostnames on page routes with plain-text remediation command", async () => {
