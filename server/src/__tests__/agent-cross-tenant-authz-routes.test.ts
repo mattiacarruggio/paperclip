@@ -52,6 +52,7 @@ const mockAgentService = vi.hoisted(() => ({
   resume: vi.fn(),
   terminate: vi.fn(),
   remove: vi.fn(),
+  update: vi.fn(),
   listKeys: vi.fn(),
   createApiKey: vi.fn(),
   getKeyById: vi.fn(),
@@ -277,6 +278,7 @@ function resetMockDefaults() {
   mockAgentService.resume.mockImplementation(async () => ({ ...baseAgent }));
   mockAgentService.terminate.mockImplementation(async () => ({ ...baseAgent }));
   mockAgentService.remove.mockImplementation(async () => ({ ...baseAgent }));
+  mockAgentService.update.mockImplementation(async () => ({ ...baseAgent }));
   mockAgentService.listKeys.mockImplementation(async () => []);
   mockAgentService.createApiKey.mockImplementation(async () => ({
     id: keyId,
@@ -373,5 +375,106 @@ describe.sequential("agent cross-tenant route authorization", () => {
     expect(res.body.error).toContain("Key not found");
     expect(mockAgentService.getKeyById).toHaveBeenCalledWith(keyId);
     expect(mockAgentService.revokeKey).not.toHaveBeenCalled();
+  });
+
+  it("F1: agent self-PATCH with allowed fields only returns 200", async () => {
+    const selfActor = {
+      type: "agent",
+      agentId,
+      companyId,
+      runId: null,
+    };
+    const app = await createApp(selfActor);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ title: "New Title", capabilities: "coding", metadata: { k: "v" } }),
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  it("F1: agent self-PATCH with disallowed field (name) returns 403", async () => {
+    const selfActor = {
+      type: "agent",
+      agentId,
+      companyId,
+      runId: null,
+    };
+    const app = await createApp(selfActor);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ name: "hacked-name" }),
+    );
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("disallowed");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("F1: agent self-PATCH with disallowed field (budgetMonthlyCents) returns 403", async () => {
+    const selfActor = {
+      type: "agent",
+      agentId,
+      companyId,
+      runId: null,
+    };
+    const app = await createApp(selfActor);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ budgetMonthlyCents: 999999 }),
+    );
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("disallowed");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("F1: schema strips role and status from PATCH body (board caller)", async () => {
+    currentAccessCanUser = true;
+    const boardActor = {
+      type: "board",
+      userId: "board-user",
+      companyIds: [companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    };
+    const app = await createApp(boardActor);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ role: "ceo", status: "paused", title: "legit" }),
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const updateCall = mockAgentService.update.mock.calls[0];
+    expect(updateCall).toBeDefined();
+    const patchData = updateCall[1] as Record<string, unknown>;
+    expect(patchData).not.toHaveProperty("role");
+    expect(patchData).not.toHaveProperty("status");
+    expect(patchData).toHaveProperty("title", "legit");
+  });
+
+  it("F2: agent PATCH with adapterConfig.env returns 403", async () => {
+    const otherAgentId = "55555555-5555-4555-8555-555555555555";
+    const ceoAgent = { ...baseAgent, id: otherAgentId, role: "ceo" };
+    mockAgentService.getById.mockImplementation(async (id: string) => {
+      if (id === otherAgentId) return { ...ceoAgent };
+      return { ...baseAgent };
+    });
+    const ceoActor = {
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+      runId: null,
+    };
+    const app = await createApp(ceoActor);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { env: { SECRET: "stolen" } } }),
+    );
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("env");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
   });
 });

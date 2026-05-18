@@ -683,7 +683,19 @@ export function agentRoutes(
       throw forbidden("Agent key cannot access another company");
     }
 
-    if (actorAgent.id === targetAgent.id) return;
+    if (actorAgent.id === targetAgent.id) {
+      const AGENT_SELF_PATCH_ALLOWED_KEYS = new Set([
+        "capabilities", "title", "icon", "desiredSkills", "metadata",
+      ]);
+      const body = req.body as Record<string, unknown>;
+      const disallowedKeys = Object.keys(body).filter((k) => !AGENT_SELF_PATCH_ALLOWED_KEYS.has(k));
+      if (disallowedKeys.length > 0) {
+        throw forbidden(
+          `Agent self-PATCH may only update capabilities, title, icon, desiredSkills, or metadata (disallowed: ${disallowedKeys.join(", ")})`,
+        );
+      }
+      return;
+    }
     if (actorAgent.role === "ceo") return;
     const allowedByGrant = await access.hasPermission(
       targetAgent.companyId,
@@ -1173,6 +1185,9 @@ export function agentRoutes(
       req,
       collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),
     );
+    if (req.actor.type === "agent" && adapterConfig.env !== undefined) {
+      throw forbidden(`Agent-authenticated callers cannot modify ${path}.env`);
+    }
   }
 
   function summarizeAgentUpdateDetails(patch: Record<string, unknown>) {
