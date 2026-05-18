@@ -77,7 +77,7 @@ import {
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
-import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
@@ -3240,6 +3240,16 @@ export function issueRoutes(
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
 
+    // F6: agents may not make structural mutations on unassigned (backlog) issues
+    // without tasks:assign permission — prevents free PATCH on the entire backlog.
+    if (req.actor.type === "agent" && existing.assigneeAgentId === null) {
+      const hasStructuralFields = (["parentId", "goalId", "projectId", "status", "assigneeAgentId", "assigneeUserId"] as const)
+        .some((field) => req.body[field] !== undefined);
+      if (hasStructuralFields) {
+        await assertCanAssignTasks(req, existing.companyId);
+      }
+    }
+
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
     const isBlocked = existing.status === "blocked";
@@ -4309,6 +4319,13 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
 
+    // F8: force-release is a privileged admin operation; require instance-admin
+    // or the tasks:manage_active_checkouts company permission.
+    if (!(req.actor.source === "local_implicit" || req.actor.isInstanceAdmin)) {
+      const allowed = await access.canUser(existing.companyId, req.actor.userId, "tasks:manage_active_checkouts");
+      if (!allowed) throw forbidden("Missing permission: tasks:manage_active_checkouts");
+    }
+
     const clearAssignee = req.query.clearAssignee === "true";
     const result = await svc.adminForceRelease(id, { clearAssignee });
     if (!result) {
@@ -4969,7 +4986,8 @@ export function issueRoutes(
       userId: actor.actorType === "user" ? actor.actorId : undefined,
       runId: actor.runId,
     }, {
-      authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
+      // F7: only board actors may override authorType; agents/users are pinned to their own type.
+      authorType: (req.actor.type === "board" ? (req.body.authorType ?? null) : null) ?? (actor.actorType === "agent" ? "agent" : "user"),
       presentation: req.body.presentation ?? null,
       metadata: req.body.metadata ?? null,
     });
