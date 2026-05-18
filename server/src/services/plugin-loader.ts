@@ -872,7 +872,7 @@ export function pluginLoader(
         // executing arbitrary code on the host before manifest validation.
         await execFileAsync(
           "npm",
-          ["install", spec, "--prefix", targetInstallDir, "--save", "--ignore-scripts"],
+          ["install", spec, "--prefix", targetInstallDir, "--no-save", "--ignore-scripts"],
           { timeout: 120_000 }, // 2 minute timeout for npm install
         );
       } catch (err) {
