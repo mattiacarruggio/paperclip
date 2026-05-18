@@ -141,6 +141,15 @@ const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const PLUGIN_API_BODY_LIMIT_BYTES = 1_000_000;
+// MAT-661 F2: webhook ingestion route is unauthenticated by design. Apply a
+// tighter pre-parse body limit (256 KB) than the global 10 MB default so a
+// flood of oversize payloads cannot fill memory before rate-limit/validation.
+export const PLUGIN_WEBHOOK_BODY_LIMIT_BYTES = 256_000;
+export const PLUGIN_WEBHOOK_PATH_REGEX = /^\/api\/plugins\/[^/]+\/webhooks\//;
+// Per-(plugin, IP) token bucket: 30 deliveries / minute steady, burst 30.
+const WEBHOOK_RATE_LIMIT_TOKENS = 30;
+const WEBHOOK_RATE_LIMIT_WINDOW_MS = 60_000;
+const WEBHOOK_RATE_LIMIT_BUCKET_TTL_MS = WEBHOOK_RATE_LIMIT_WINDOW_MS * 5;
 const PLUGIN_SCOPED_API_RESPONSE_HEADER_ALLOWLIST = new Set([
   "cache-control",
   "etag",
@@ -150,6 +159,62 @@ const PLUGIN_SCOPED_API_RESPONSE_HEADER_ALLOWLIST = new Set([
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../..");
+
+/**
+ * MAT-661 F2: per-(plugin, IP) token bucket for the unauthenticated webhook
+ * ingestion route. Pure in-memory (single-process) — Paperclip self-host
+ * deployments run one server replica, so a shared cache (Redis) would be
+ * overkill. Buckets are lazily expired to keep memory bounded under a flood
+ * of unique pluginId/IP pairs.
+ */
+interface WebhookRateBucket {
+  tokens: number;
+  refilledAt: number;
+}
+const webhookRateBuckets = new Map<string, WebhookRateBucket>();
+let lastWebhookRateBucketSweep = 0;
+
+function consumeWebhookRateToken(key: string, now: number = Date.now()): boolean {
+  if (process.env.PAPERCLIP_DISABLE_RATE_LIMIT === "1") return true;
+  // Sweep expired buckets at most once per window to amortize cost.
+  if (now - lastWebhookRateBucketSweep > WEBHOOK_RATE_LIMIT_WINDOW_MS) {
+    lastWebhookRateBucketSweep = now;
+    for (const [bucketKey, bucket] of webhookRateBuckets) {
+      if (now - bucket.refilledAt > WEBHOOK_RATE_LIMIT_BUCKET_TTL_MS) {
+        webhookRateBuckets.delete(bucketKey);
+      }
+    }
+  }
+  let bucket = webhookRateBuckets.get(key);
+  if (!bucket) {
+    bucket = { tokens: WEBHOOK_RATE_LIMIT_TOKENS, refilledAt: now };
+    webhookRateBuckets.set(key, bucket);
+  } else {
+    const elapsed = now - bucket.refilledAt;
+    if (elapsed >= WEBHOOK_RATE_LIMIT_WINDOW_MS) {
+      bucket.tokens = WEBHOOK_RATE_LIMIT_TOKENS;
+      bucket.refilledAt = now;
+    } else {
+      const refill = Math.floor(
+        (elapsed / WEBHOOK_RATE_LIMIT_WINDOW_MS) * WEBHOOK_RATE_LIMIT_TOKENS,
+      );
+      if (refill > 0) {
+        bucket.tokens = Math.min(WEBHOOK_RATE_LIMIT_TOKENS, bucket.tokens + refill);
+        bucket.refilledAt = now;
+      }
+    }
+  }
+  if (bucket.tokens <= 0) return false;
+  bucket.tokens -= 1;
+  return true;
+}
+
+// Exported for tests: reset state between cases without touching the bucket
+// internals.
+export function __resetWebhookRateLimiterForTests(): void {
+  webhookRateBuckets.clear();
+  lastWebhookRateBucketSweep = 0;
+}
 
 const BUNDLED_PLUGIN_EXAMPLES: AvailablePluginExample[] = [
   {
@@ -2243,11 +2308,22 @@ export function pluginRoutes(
    * endpoints must be publicly accessible for external callers. Signature
    * verification is the plugin's responsibility.
    *
+   * MAT-661 (F2/F10): hardened against anonymous DoS and plugin-ID
+   * enumeration:
+   * - Pre-parse body limit `PLUGIN_WEBHOOK_BODY_LIMIT_BYTES` enforced by the
+   *   dedicated `express.json()` parser dispatched in app.ts.
+   * - Per-(plugin, IP) token bucket rate limit (429 with `Retry-After`).
+   * - DB row only persisted AFTER rate-limit + validation pass.
+   * - All non-success validation paths collapse to one generic 404; the real
+   *   reason is logged server-side via `console.warn`.
+   *
    * Response: `{ deliveryId: string, status: string }`
    * Errors:
-   * - 404 if plugin not found or endpointKey not declared
-   * - 400 if plugin is not in ready state or lacks webhooks.receive capability
-   * - 502 if the worker is unavailable or the RPC call fails
+   * - 404 for any validation failure (plugin missing/not-ready/no capability/
+   *   endpoint key not declared) — single error string to avoid enumeration.
+   * - 413 if the request body exceeds `PLUGIN_WEBHOOK_BODY_LIMIT_BYTES`.
+   * - 429 if the per-(plugin, IP) rate limit is exceeded.
+   * - 502 if the worker is unavailable or the RPC call fails.
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
     if (!webhookDeps) {
@@ -2256,50 +2332,81 @@ export function pluginRoutes(
     }
 
     const { pluginId, endpointKey } = req.params;
+    const generic404 = { error: "Webhook not delivered" } as const;
 
-    // Step 1: Resolve the plugin
+    // Step 1: Rate-limit per (pluginId, IP). Anonymous, so IP is the only
+    // client identifier we trust here. Bucket is consulted BEFORE any DB
+    // call or plugin lookup so a flood is cheap to drop.
+    const rateLimitActor = `${pluginId}:${req.ip ?? "unknown"}`;
+    if (!consumeWebhookRateToken(rateLimitActor)) {
+      res.setHeader(
+        "Retry-After",
+        String(Math.ceil(WEBHOOK_RATE_LIMIT_WINDOW_MS / 1000)),
+      );
+      res.status(429).json({ error: "Too many webhook deliveries" });
+      return;
+    }
+
+    // Step 2: Reject oversize bodies. The dedicated express.json parser in
+    // app.ts already rejects with 413 pre-parse, but we re-check against the
+    // captured rawBody so the cap holds even if the parser is mis-mounted.
+    const stashedRaw = (req as unknown as { rawBody?: Buffer }).rawBody;
+    if (stashedRaw && stashedRaw.byteLength > PLUGIN_WEBHOOK_BODY_LIMIT_BYTES) {
+      res.status(413).json({ error: "Webhook payload too large" });
+      return;
+    }
+
+    // Step 3: Resolve and validate the plugin. All validation branches below
+    // funnel into the same generic 404 to avoid leaking plugin install state
+    // via error distinguishability (audit F10).
     const plugin = await resolvePlugin(registry, pluginId);
     if (!plugin) {
-      res.status(404).json({ error: "Plugin not found" });
+      console.warn(
+        `[plugin-webhook] reject pluginId=${pluginId} endpointKey=${endpointKey} reason=plugin_not_found`,
+      );
+      res.status(404).json(generic404);
       return;
     }
 
-    // Step 2: Validate the plugin is in 'ready' state
     if (plugin.status !== "ready") {
-      res.status(400).json({
-        error: `Plugin is not ready (current status: ${plugin.status})`,
-      });
+      console.warn(
+        `[plugin-webhook] reject pluginId=${plugin.id} endpointKey=${endpointKey} reason=plugin_not_ready status=${plugin.status}`,
+      );
+      res.status(404).json(generic404);
       return;
     }
 
-    // Step 3: Validate the plugin has webhooks.receive capability
     const manifest = plugin.manifestJson;
     if (!manifest) {
-      res.status(400).json({ error: "Plugin manifest is missing" });
+      console.warn(
+        `[plugin-webhook] reject pluginId=${plugin.id} endpointKey=${endpointKey} reason=manifest_missing`,
+      );
+      res.status(404).json(generic404);
       return;
     }
 
     const capabilities = manifest.capabilities ?? [];
     if (!capabilities.includes("webhooks.receive")) {
-      res.status(400).json({
-        error: "Plugin does not have the webhooks.receive capability",
-      });
+      console.warn(
+        `[plugin-webhook] reject pluginId=${plugin.id} endpointKey=${endpointKey} reason=capability_missing`,
+      );
+      res.status(404).json(generic404);
       return;
     }
 
-    // Step 4: Validate the endpointKey exists in the manifest's webhook declarations
     const declaredWebhooks = manifest.webhooks ?? [];
     const webhookDecl = declaredWebhooks.find(
       (w) => w.endpointKey === endpointKey,
     );
     if (!webhookDecl) {
-      res.status(404).json({
-        error: `Webhook endpoint '${endpointKey}' is not declared by this plugin`,
-      });
+      console.warn(
+        `[plugin-webhook] reject pluginId=${plugin.id} endpointKey=${endpointKey} reason=endpoint_not_declared`,
+      );
+      res.status(404).json(generic404);
       return;
     }
 
-    // Step 5: Extract request data
+    // Step 4: Extract request data
     const requestId = randomUUID();
     const rawHeaders: Record<string, string> = {};
     for (const [key, value] of Object.entries(req.headers)) {
@@ -2313,12 +2420,13 @@ export function pluginRoutes(
     // Use the raw buffer stashed by the express.json() `verify` callback.
     // This preserves the exact bytes the provider signed, whereas
     // JSON.stringify(req.body) would re-serialize and break HMAC verification.
-    const stashedRaw = (req as unknown as { rawBody?: Buffer }).rawBody;
     const rawBody = stashedRaw ? stashedRaw.toString("utf-8") : "";
     const parsedBody = req.body as unknown;
     const payload = (req.body as Record<string, unknown> | undefined) ?? {};
 
-    // Step 6: Record the delivery in the database
+    // Step 5: Record the delivery in the database. Persistence happens only
+    // after rate-limit + plugin/endpoint validation succeed so anonymous
+    // floods cannot exhaust storage with garbage rows.
     const startedAt = new Date();
     const [delivery] = await db
       .insert(pluginWebhookDeliveries)
@@ -2332,7 +2440,7 @@ export function pluginRoutes(
       })
       .returning({ id: pluginWebhookDeliveries.id });
 
-    // Step 7: Dispatch to the worker via handleWebhook RPC
+    // Step 6: Dispatch to the worker via handleWebhook RPC
     try {
       await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
         endpointKey,
@@ -2342,7 +2450,7 @@ export function pluginRoutes(
         requestId,
       });
 
-      // Step 8: Update delivery record to success
+      // Step 7: Update delivery record to success
       const finishedAt = new Date();
       const durationMs = finishedAt.getTime() - startedAt.getTime();
       await db
@@ -2359,7 +2467,7 @@ export function pluginRoutes(
         status: "success",
       });
     } catch (err) {
-      // Step 8 (error): Update delivery record to failed
+      // Step 7 (error): Update delivery record to failed
       const finishedAt = new Date();
       const durationMs = finishedAt.getTime() - startedAt.getTime();
       const errorMessage = err instanceof Error ? err.message : String(err);

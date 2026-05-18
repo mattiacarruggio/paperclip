@@ -38,7 +38,11 @@ import { llmRoutes } from "./routes/llms.js";
 import { authRoutes } from "./routes/auth.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
-import { pluginRoutes } from "./routes/plugins.js";
+import {
+  pluginRoutes,
+  PLUGIN_WEBHOOK_BODY_LIMIT_BYTES,
+  PLUGIN_WEBHOOK_PATH_REGEX,
+} from "./routes/plugins.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -137,13 +141,37 @@ export async function createApp(
 ) {
   const app = express();
 
-  app.use(express.json({
+  const captureRawBody = (req: ExpressRequest, _res: express.Response, buf: Buffer) => {
+    (req as unknown as { rawBody: Buffer }).rawBody = buf;
+  };
+  // MAT-661 F2: webhook ingestion path gets a tighter pre-parse limit than
+  // the global 10 MB parser. express.json() rejects oversize payloads with
+  // 413 before buffering, so a flood of large bodies never reaches the route
+  // handler or the rawBody capture.
+  const pluginWebhookJsonParser = express.json({
+    limit: PLUGIN_WEBHOOK_BODY_LIMIT_BYTES,
+    verify: captureRawBody,
+  });
+  const defaultJsonParser = express.json({
     // Company import/export payloads can inline full portable packages.
     limit: "10mb",
-    verify: (req, _res, buf) => {
-      (req as unknown as { rawBody: Buffer }).rawBody = buf;
-    },
-  }));
+    verify: captureRawBody,
+  });
+  app.use((req, res, next) => {
+    if (PLUGIN_WEBHOOK_PATH_REGEX.test(req.path)) {
+      return pluginWebhookJsonParser(req, res, next);
+    }
+    return defaultJsonParser(req, res, next);
+  });
+  // MAT-661 F2: surface body-parser's `entity.too.large` as a real 413
+  // instead of falling through to the generic 500 error handler.
+  app.use((err: unknown, _req: ExpressRequest, res: express.Response, next: express.NextFunction) => {
+    if (err && typeof err === "object" && (err as { type?: string }).type === "entity.too.large") {
+      res.status(413).json({ error: "Request entity too large" });
+      return;
+    }
+    next(err);
+  });
   app.use(httpLogger);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
