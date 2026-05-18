@@ -2011,7 +2011,7 @@ function resolveWorkerEntrypoint(
   // For local-path installs we persist the resolved package path; use it first
   if (plugin.packagePath && existsSync(plugin.packagePath)) {
     const entrypoint = path.resolve(plugin.packagePath, workerRelPath);
-    if (entrypoint.startsWith(path.resolve(plugin.packagePath)) && existsSync(entrypoint)) {
+    if (isPathInsideDir(entrypoint, plugin.packagePath) && existsSync(entrypoint)) {
       return entrypoint;
     }
   }
@@ -2036,8 +2036,9 @@ function resolveWorkerEntrypoint(
   for (const dir of [packageDir, directDir]) {
     const entrypoint = path.resolve(dir, workerRelPath);
 
-    // Security: ensure entrypoint is actually inside the directory (prevent path traversal)
-    if (!entrypoint.startsWith(path.resolve(dir))) {
+    // Security: ensure entrypoint is actually inside the directory (prevent path traversal).
+    // Use path.relative semantics so an adjacent sibling like `<dir>-evil` cannot pass the guard.
+    if (!isPathInsideDir(entrypoint, dir)) {
       continue;
     }
 
